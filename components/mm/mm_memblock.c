@@ -169,6 +169,119 @@ rt_err_t rt_memblock_reserve_memory(char *name, rt_size_t start, rt_size_t end, 
     return _memblock_add_range(&mmblk_reserved, name, start, end, flags);
 }
 
+static void _next_free_region(struct rt_mmblk_reg **m, struct rt_mmblk_reg **r, mmblk_flag_t flags,
+                      rt_size_t *out_start, rt_size_t *out_end)
+{
+    /* memory related data */
+    rt_size_t m_start = 0;
+    rt_size_t m_end = 0;
+
+    /* reserved related data */
+    rt_size_t r_start = 0;
+    rt_size_t r_end = 0;
+    struct rt_mmblk_reg *r_sentinel = rt_slist_entry(&(mmblk_reserved.reg_list), struct rt_mmblk_reg, node);
+
+    for (; *m != RT_NULL; *m = _next_region(*m))
+    {
+        if ((*m)->flags != flags)
+            continue;
+
+        m_start = (*m)->memreg.start;
+        m_end = (*m)->memreg.end;
+
+        for (; *r != RT_NULL; *r = _next_region(*r))
+        {
+            /*
+             * r started with _resreg_guard
+             * Find the complement of reserved memblock.
+             * For example, if reserved memblock is following:
+             *
+             *  0:[8-16), 1:[32-48), 2:[128-130)
+             *
+             * The upper 32bit indexes the following regions.
+             *
+             *  0:[0-8), 1:[16-32), 2:[48-128), 3:[130-MAX)
+             *
+             * So we can find intersecting region other than excluding.
+             */
+            r_start = (*r == r_sentinel) ? 0 : (*r)->memreg.end;
+            r_end = (_next_region(*r)) ? _next_region(*r)->memreg.start : PHYS_ADDR_MAX;
+
+            /* two reserved region are adjacent */
+            if (r_start == r_end)
+                continue;
+
+            if (r_start >= m_end)
+                break;
+
+            if (m_start < r_end)
+            {
+                *out_start = MAX(m_start, r_start);
+                *out_end = MIN(m_end, r_end);
+
+                if (m_end <= r_end)
+                    *m = _next_region(*m);
+                else
+                    *r = _next_region(*r);
+                return;
+            }
+        }
+    }
+
+    /* all regions found */
+    *m = rt_slist_entry(&(mmblk_memory.reg_list), struct rt_mmblk_reg, node);
+}
+
+/* for each region in memory with flags and not reserved */
+#define for_each_free_region(m, r, flags, p_start, p_end)                               \
+    m = rt_slist_entry(&(mmblk_memory.reg_list.next), struct rt_mmblk_reg, node);       \
+    r = rt_slist_entry(&(mmblk_reserved.reg_list), struct rt_mmblk_reg, node);          \
+    for (_next_free_region(&m, &r, flags, p_start, p_end);                              \
+         m != rt_slist_entry(&(mmblk_memory.reg_list), struct rt_mmblk_reg, node);      \
+         _next_free_region(&m, &r, flags, p_start, p_end))
+
+rt_err_t rt_memblock_alloc_reserved_memory(char *name, rt_size_t size, rt_size_t align, \
+                                    rt_size_t start, rt_size_t end, mmblk_flag_t flag, rt_size_t *base)
+{
+    rt_region_t reg;
+    struct rt_mmblk_reg *m, *r;
+    rt_size_t r_start, r_end;
+
+    if (start >= end)
+        return -RT_EINVAL;
+
+    for_each_free_region(m, r, MEMBLOCK_NONE, &reg.start, &reg.end)
+    {
+        r_start = RT_ALIGN(MAX(reg.start, start), align);
+        r_end = RT_ALIGN_DOWN(MIN(reg.end, end), align);
+
+        if (r_start < r_end && r_end - r_start >= size)
+        {
+            *base = r_start;
+            rt_memblock_reserve_memory(name, r_start, r_start + size, flag);
+            return RT_EOK;
+        }
+    }
+    return -RT_ENOMEM;
+}
+
+/* merge normal memory regions */
+static void _memblock_merge_memory(void)
+{
+    struct rt_mmblk_reg *reg;
+
+    rt_slist_for_each_entry(reg, &(mmblk_memory.reg_list), node)
+    {
+        while (_next_region(reg) &&
+            reg->flags == _next_region(reg)->flags &&
+            reg->memreg.end == _next_region(reg)->memreg.start)
+        {
+            reg->memreg.end = _next_region(reg)->memreg.end;
+            _reg_remove_after(reg);
+        }
+    }
+}
+
 /* [*start_reg, *end_reg) is the isolated range */
 static rt_err_t _memblock_separate_range(struct rt_memblock *memblock,
                     rt_size_t start, rt_size_t end,
@@ -242,94 +355,6 @@ static void _memblock_set_flag(struct rt_mmblk_reg *start_reg, struct rt_mmblk_r
 
     for (struct rt_mmblk_reg *iter = start_reg; iter != end_reg; iter = _next_region(iter)) {
         iter->flags |= flags;
-    }
-}
-
-static void _next_free_region(struct rt_mmblk_reg **m, struct rt_mmblk_reg **r, mmblk_flag_t flags,
-                      rt_size_t *out_start, rt_size_t *out_end)
-{
-    /* memory related data */
-    rt_size_t m_start = 0;
-    rt_size_t m_end = 0;
-
-    /* reserved related data */
-    rt_size_t r_start = 0;
-    rt_size_t r_end = 0;
-    struct rt_mmblk_reg *r_sentinel = rt_slist_entry(&(mmblk_reserved.reg_list), struct rt_mmblk_reg, node);
-
-    for (; *m != RT_NULL; *m = _next_region(*m))
-    {
-        if ((*m)->flags != flags)
-            continue;
-
-        m_start = (*m)->memreg.start;
-        m_end = (*m)->memreg.end;
-
-        for (; *r != RT_NULL; *r = _next_region(*r))
-        {
-            /*
-             * r started with _resreg_guard
-             * Find the complement of reserved memblock.
-             * For example, if reserved memblock is following:
-             *
-             *  0:[8-16), 1:[32-48), 2:[128-130)
-             *
-             * The upper 32bit indexes the following regions.
-             *
-             *  0:[0-8), 1:[16-32), 2:[48-128), 3:[130-MAX)
-             *
-             * So we can find intersecting region other than excluding.
-             */
-            r_start = (*r == r_sentinel) ? 0 : (*r)->memreg.end;
-            r_end = (_next_region(*r)) ? _next_region(*r)->memreg.start : PHYS_ADDR_MAX;
-
-            /* two reserved region are adjacent */
-            if (r_start == r_end)
-                continue;
-
-            if (r_start >= m_end)
-                break;
-
-            if (m_start < r_end)
-            {
-                *out_start = MAX(m_start, r_start);
-                *out_end = MIN(m_end, r_end);
-
-                if (m_end <= r_end)
-                    *m = _next_region(*m);
-                else
-                    *r = _next_region(*r);
-                return;
-            }
-        }
-    }
-
-    /* all regions found */
-    *m = rt_slist_entry(&(mmblk_memory.reg_list), struct rt_mmblk_reg, node);
-}
-
-/* for each region in memory with flags and not reserved */
-#define for_each_free_region(m, r, flags, p_start, p_end)                               \
-    m = rt_slist_entry(&(mmblk_memory.reg_list.next), struct rt_mmblk_reg, node);       \
-    r = rt_slist_entry(&(mmblk_reserved.reg_list), struct rt_mmblk_reg, node);          \
-    for (_next_free_region(&m, &r, flags, p_start, p_end);                              \
-         m != rt_slist_entry(&(mmblk_memory.reg_list), struct rt_mmblk_reg, node);      \
-         _next_free_region(&m, &r, flags, p_start, p_end))
-
-/* merge normal memory regions */
-static void _memblock_merge_memory(void)
-{
-    struct rt_mmblk_reg *reg;
-
-    rt_slist_for_each_entry(reg, &(mmblk_memory.reg_list), node)
-    {
-        while (_next_region(reg) &&
-            reg->flags == _next_region(reg)->flags &&
-            reg->memreg.end == _next_region(reg)->memreg.start)
-        {
-            reg->memreg.end = _next_region(reg)->memreg.end;
-            _reg_remove_after(reg);
-        }
     }
 }
 

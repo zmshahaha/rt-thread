@@ -15,6 +15,7 @@
 #include <drivers/ofw_fdt.h>
 #include <drivers/ofw_raw.h>
 #include <drivers/core/dm.h>
+#include <mm_memblock.h>
 
 #define DBG_TAG "rtdm.ofw"
 #define DBG_LVL DBG_INFO
@@ -25,13 +26,6 @@
 struct rt_fdt_earlycon fdt_earlycon rt_section(".bss.noclean.earlycon");
 
 RT_OFW_SYMBOL_TYPE_RANGE(earlycon, struct rt_fdt_earlycon_id, _earlycon_start = {}, _earlycon_end = {});
-
-#ifndef ARCH_INIT_MEMREGION_NR
-#define ARCH_INIT_MEMREGION_NR 128
-#endif
-
-static rt_region_t _memregion[ARCH_INIT_MEMREGION_NR] rt_section(".bss.noclean.memregion");
-static int _memregion_front_idx = 0, _memregion_last_idx = RT_ARRAY_SIZE(_memregion) - 1;
 
 static void *_fdt = RT_NULL;
 static rt_phandle _phandle_min;
@@ -141,71 +135,6 @@ rt_bool_t rt_fdt_device_is_available(void *fdt, int nodeoffset)
     return ret;
 }
 
-rt_err_t rt_fdt_commit_memregion_early(rt_region_t *region, rt_bool_t is_reserved)
-{
-    rt_err_t err = RT_EOK;
-
-    if (region && region->name)
-    {
-        if (_memregion_front_idx < _memregion_last_idx)
-        {
-            int idx;
-
-            if (!_memregion_front_idx && _memregion_last_idx == RT_ARRAY_SIZE(_memregion) - 1)
-            {
-                for (int i = 0; i < RT_ARRAY_SIZE(_memregion); ++i)
-                {
-                    _memregion[i].name = RT_NULL;
-                }
-            }
-
-            idx = is_reserved ? _memregion_last_idx-- : _memregion_front_idx++;
-
-            rt_memcpy(&_memregion[idx], region, sizeof(*region));
-        }
-        else
-        {
-            err = -RT_EEMPTY;
-        }
-    }
-    else
-    {
-        err = -RT_EINVAL;
-    }
-
-    return err;
-}
-
-rt_err_t rt_fdt_commit_memregion_request(rt_region_t **out_region, rt_size_t *out_nr, rt_bool_t is_reserved)
-{
-    rt_err_t err = RT_EOK;
-
-    if (out_region && out_nr)
-    {
-        if (is_reserved)
-        {
-            *out_region = &_memregion[_memregion_last_idx + 1];
-            *out_nr = RT_ARRAY_SIZE(_memregion) - 1 - _memregion_last_idx;
-        }
-        else
-        {
-            *out_region = &_memregion[0];
-            *out_nr = _memregion_front_idx;
-        }
-
-        if (*out_nr == 0)
-        {
-            err = -RT_EEMPTY;
-        }
-    }
-    else
-    {
-        err = -RT_EINVAL;
-    }
-
-    return err;
-}
-
 rt_err_t rt_fdt_prefetch(void *fdt)
 {
     rt_err_t err = -RT_ERROR;
@@ -257,26 +186,6 @@ rt_err_t rt_fdt_scan_root(void)
     return err;
 }
 
-rt_inline rt_err_t commit_memregion(const char *name, rt_uint64_t base, rt_uint64_t size, rt_bool_t is_reserved)
-{
-    return rt_fdt_commit_memregion_early(&(rt_region_t)
-    {
-        .name = name,
-        .start = (rt_size_t)base,
-        .end = (rt_size_t)(base + size),
-    }, is_reserved);
-}
-
-static rt_err_t reserve_memregion(const char *name, rt_uint64_t base, rt_uint64_t size)
-{
-    if (commit_memregion(name, base, size, RT_TRUE) == -RT_EEMPTY)
-    {
-        LOG_W("Reserved memory: %p - %p%s", base, base + size, " unable to record");
-    }
-
-    return RT_EOK;
-}
-
 static rt_err_t fdt_reserved_mem_check_root(int nodeoffset)
 {
     rt_err_t err = RT_EOK;
@@ -305,10 +214,9 @@ static rt_err_t fdt_reserved_mem_check_root(int nodeoffset)
     return err;
 }
 
-static rt_err_t fdt_reserved_memory_reg(int nodeoffset, const char *uname)
+/* reserve single /reserved-memory node with reg prop */
+static void fdt_reserved_memory_reg(int nodeoffset, const char *uname)
 {
-    rt_err_t err = RT_EOK;
-
     rt_ubase_t base, size;
     const fdt32_t *prop;
     int len, t_len = (_root_addr_cells + _root_size_cells) * sizeof(fdt32_t);
@@ -318,7 +226,6 @@ static rt_err_t fdt_reserved_memory_reg(int nodeoffset, const char *uname)
         if (len && len % t_len != 0)
         {
             LOG_E("Reserved memory: invalid reg property in '%s', skipping node", uname);
-            err = -RT_EINVAL;
         }
         else
         {
@@ -332,16 +239,104 @@ static rt_err_t fdt_reserved_memory_reg(int nodeoffset, const char *uname)
                     continue;
                 }
 
+                rt_bool_t is_nomap = fdt_getprop(_fdt, nodeoffset, "no-map", RT_NULL) ? RT_TRUE : RT_FALSE;
                 base = rt_fdt_translate_address(_fdt, nodeoffset, base);
-                reserve_memregion(fdt_get_name(_fdt, nodeoffset, RT_NULL), base, size);
+                rt_memblock_reserve_memory(uname, base, base + size, is_nomap);
 
                 len -= t_len;
             }
         }
     }
-    else
+}
+
+/* reserve single /reserved-memory node need to allocate from memblock */
+static void fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
+{
+    rt_ubase_t base, size, align;
+    rt_size_t start, end;
+    const fdt32_t *prop;
+    int len, t_len = (_root_addr_cells + _root_size_cells) * sizeof(fdt32_t);
+    rt_bool_t nomap;
+    fdt32_t *cells;
+    rt_err_t err = -RT_ERROR;
+
+    if ((prop = fdt_getprop(_fdt, nodeoffset, "size", &len)))
     {
-        err = -RT_EEMPTY;
+        /* a /reserved-memory node's size must have just one size cell */
+        if (len != _root_size_cells * sizeof(fdt32_t))
+        {
+            LOG_E("Reserved memory: invalid size property in '%s', skipping node", uname);
+            return;
+        }
+
+        size = rt_fdt_next_cell(&prop, _root_size_cells);
+        nomap = fdt_getprop(_fdt, nodeoffset, "no-map", RT_NULL) ? RT_TRUE : RT_FALSE;
+        prop = fdt_getprop(_fdt, nodeoffset, "alignment", &len);
+
+        if (prop)
+        {
+            if (len != _root_addr_cells * sizeof(fdt32_t))
+            {
+                LOG_E("Reserved memory: invalid alignment property in '%s', skipping node", uname);
+                return;
+            }
+            align = rt_fdt_next_cell(&prop, _root_addr_cells);
+        }
+
+        // TODO: when CMA mechanism add
+
+        prop = fdt_getprop(_fdt, nodeoffset, "alloc-ranges", &len);
+
+        if (prop)
+        {
+            if (len % t_len != 0)
+            {
+                LOG_E("Reserved memory: invalid alloc-ranges property in '%s', skipping node", uname);
+                return;
+            }
+
+            while (len > 0)
+            {
+                start = rt_fdt_next_cell(&prop, _root_addr_cells);
+                end = start + rt_fdt_next_cell(&prop, _root_size_cells);
+                len -= t_len;
+
+                if ((err = rt_memblock_alloc_reserved_memory(uname, size, align, start, end, nomap, &base)) == RT_EOK)
+                {
+                    break;
+                }
+            }
+        }
+        else
+        {
+            start = 0;
+            end = ~(rt_size_t)0;
+
+            err = rt_memblock_alloc_reserved_memory(uname, size, align, start, end, nomap, &base);
+        }
+    }
+
+    if (err = RT_EOK)
+    {
+        /* translate phy addr back to /reserved-memory addr space */
+        base = base - rt_fdt_translate_address(_fdt, nodeoffset, 0);
+
+        /* fill cells to add to fdt */
+        cells = (fdt32_t*)rt_malloc((_root_addr_cells + _root_size_cells) * sizeof(fdt32_t));
+        for (len = _root_addr_cells; len--; ++cells)
+        {
+            *cells = cpu_to_fdt32((uint32_t)base & 0xffffffff);
+            base >>= 32;
+        }
+        for (len = _root_size_cells; len--; ++cells)
+        {
+            *cells = cpu_to_fdt32((uint32_t)size & 0xffffffff);
+            size >>= 32;
+        }
+        cells -= (_root_addr_cells + _root_size_cells);
+
+        /* add the alloced region to fdt */
+        fdt_setprop(_fdt, nodeoffset, "reg", cells, _root_addr_cells + _root_size_cells);
     }
 
     return err;
@@ -356,10 +351,10 @@ static void fdt_scan_reserved_memory(void)
     if (nodeoffset >= 0)
     {
         if (!fdt_reserved_mem_check_root(nodeoffset))
-        {
+        {   
+            /* reserve /reserved-memory with reg prop*/
             fdt_for_each_subnode(child, _fdt, nodeoffset)
             {
-                rt_err_t err;
                 const char *uname;
 
                 if (!rt_fdt_device_is_available(_fdt, child))
@@ -368,12 +363,20 @@ static void fdt_scan_reserved_memory(void)
                 }
 
                 uname = fdt_get_name(_fdt, child, RT_NULL);
-                err = fdt_reserved_memory_reg(child, uname);
+                fdt_reserved_memory_reg(child, uname);
+            }
+            /* reserve /reserved-memory need to allocate from memblock */
+            fdt_for_each_subnode(child, _fdt, nodeoffset)
+            {
+                const char *uname;
 
-                if (err == -RT_EEMPTY && fdt_getprop(_fdt, child, "size", RT_NULL))
+                if (!rt_fdt_device_is_available(_fdt, child))
                 {
-                    reserve_memregion(fdt_get_name(_fdt, child, RT_NULL), 0, 0);
+                    continue;
                 }
+
+                uname = fdt_get_name(_fdt, child, RT_NULL);
+                fdt_reserved_memory_alloc(child, uname);
             }
         }
         else
@@ -400,7 +403,7 @@ static rt_err_t fdt_scan_memory(void)
             break;
         }
 
-        reserve_memregion("memreserve", base, size);
+        rt_memblock_reserve_memory("memreserve", base, base + size, MEMBLOCK_NONE);
     }
 
     no = 0;
@@ -442,7 +445,8 @@ static rt_err_t fdt_scan_memory(void)
                 continue;
             }
 
-            err = commit_memregion(name, base, size, RT_FALSE);
+            bool is_hotpluggable = fdt_getprop(_fdt, nodeoffset, "hotpluggable", RT_NULL) ? RT_TRUE : RT_FALSE;
+            err = rt_memblock_add_memory(name, base, size, is_hotpluggable);
 
             if (!err)
             {

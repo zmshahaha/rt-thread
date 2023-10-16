@@ -71,6 +71,22 @@ rt_err_t rt_memblock_add_memory(char *name, rt_size_t start, rt_size_t end, mmbl
 rt_err_t rt_memblock_reserve_memory(char *name, rt_size_t start, rt_size_t end, mmblk_flag_t flags);
 
 /**
+ * @brief Alloc a physical memory range as reserved memory
+ * 
+ * @note The func must called after all fix address reserved memory recorded
+ * 
+ * @param name the name of the reseved region
+ * @param size the size needed as reserved memory
+ * @param align the alloced region must aligned to it
+ * @param start the start addr of the allowed range
+ * @param end the end addr of the allowed range
+ * @param flag the flag of the region
+ * @param base store the alloced range start
+ */
+rt_err_t rt_memblock_alloc_reserved_memory(char *name, rt_size_t size, rt_size_t align, \
+                                    rt_size_t start, rt_size_t end, mmblk_flag_t flag, rt_size_t *base);
+
+/**
  * @brief To conclude the management of memory by the memblock.
  *
  * @note This function will free all usable to buddy system and map all memory without
