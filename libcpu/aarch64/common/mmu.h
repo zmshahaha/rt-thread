@@ -76,9 +76,12 @@ struct rt_aspace;
 void rt_hw_mmu_ktbl_set(unsigned long tbl);
 void rt_hw_mem_setup_early(unsigned long *tbl0, unsigned long *tbl1,
                            unsigned long size, unsigned long pv_off);
+#ifdef RT_USING_MEMBLOCK
+void rt_hw_mmu_setup(void);
+#else
 void rt_hw_mmu_setup(struct rt_aspace *aspace, struct mem_desc *mdesc,
                      int desc_nr);
-
+#endif
 int rt_hw_mmu_map_init(struct rt_aspace *aspace, void *v_address,
                        rt_size_t size, rt_size_t *vtable, rt_size_t pv_off);
 void *rt_hw_mmu_map(struct rt_aspace *aspace, void *v_addr, void *p_addr,

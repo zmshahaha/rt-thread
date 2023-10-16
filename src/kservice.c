@@ -1683,6 +1683,18 @@ rt_inline void _slab_info(rt_size_t *total,
 #define _MEM_FREE(_ptr) \
     rt_slab_free(system_heap, _ptr)
 #define _MEM_INFO       _slab_info
+#elif defined(RT_USING_BALLOONSLAB_AS_HEAP)
+static rt_slab_t system_heap;
+#define _MEM_INIT(_name, _start, _size) \
+    system_heap = rt_balloonslab_init(_name, _start, _size)
+#define _MEM_MALLOC(_size)  \
+    rt_balloonslab_alloc(_size)
+#define _MEM_REALLOC(_ptr, _newsize)    \
+    rt_balloonslab_realloc(_ptr, _newsize)
+#define _MEM_FREE(_ptr) \
+    rt_balloonslab_free(_ptr)
+#define _MEM_INFO(_total, _used, _max)   \
+    rt_balloonslab_info(&system_heap, _total, _used, _max)
 #else
 #define _MEM_INIT(...)
 #define _MEM_MALLOC(...)     RT_NULL

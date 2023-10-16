@@ -340,6 +340,17 @@ menu "Memory Management"
             bool "SLAB Algorithm for large memory"
             select RT_USING_SLAB
 
+        config RT_USING_BALLOONSLAB_AS_HEAP
+            bool "Scalable Version of the SLAB Algorithm for Large Memory"
+            select RT_USING_SLAB
+
+            if RT_USING_BALLOONSLAB_AS_HEAP
+                config RT_SLAB_GRAIN_SIZE
+                    hex "Granularity during Slab Expansion and Contraction"
+                    range 0x200000 0x2000000
+                    default 0x200000
+            endif
+
         config RT_USING_USERHEAP
             bool "Use user heap"
             help

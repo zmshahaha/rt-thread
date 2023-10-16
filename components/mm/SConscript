@@ -9,6 +9,8 @@ if GetDepend('ARCH_ARM_CORTEX_A') or GetDepend('ARCH_ARMV8') or GetDepend('ARCH_
     src += ['avl_adpt.c', 'ioremap.c', 'mm_aspace.c', 'mm_fault.c', 'mm_kmem.c', 'mm_object.c', 'mm_page.c']
     if GetDepend('RT_USING_MEMBLOCK'):
         src += ['mm_memblock.c']
+    if GetDepend('RT_USING_BALLOONSLAB_AS_HEAP'):
+        src += ['mm_balloonslab.c']
     CPPPATH = [cwd]
 
     group = DefineGroup('mm', src, depend = ['ARCH_MM_MMU'], CPPPATH = CPPPATH)

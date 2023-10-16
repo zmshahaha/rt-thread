@@ -366,6 +366,50 @@ void rt_hw_mmu_ktbl_set(unsigned long tbl)
     __asm__ volatile("ic ialluis\n dsb sy\nisb" ::: "memory");
 }
 
+#ifdef RT_USING_MEMBLOCK
+#include <memblock.h>
+/**
+ * @brief setup Page Table for kernel space. It's a fixed map
+ * and all mappings cannot be changed after initialization.
+ */
+void rt_hw_mmu_setup(void)
+{
+    struct rt_memblock *memory = rt_memblock_get_memory();
+    struct rt_mmblk_reg *iter;
+    struct rt_mm_va_hint hint;
+    rt_size_t attr = MMU_MAP_K_RWCB;
+    rt_size_t start, end;
+    void *err;
+
+    rt_slist_for_each_entry(iter, &(memory->reg_list), node)
+    {
+        if (iter->flags | MEMBLOCK_NOMAP == 0)
+        {
+            start = RT_ALIGN(iter->memreg.start, ARCH_PAGE_SIZE);
+            end = RT_ALIGN_DOWN(iter->memreg.end, ARCH_PAGE_SIZE);
+
+            hint = {.flags = MMF_MAP_FIXED,
+                    .limit_start = rt_kernel_space.start,
+                    .limit_range_size = rt_kernel_space.size,
+                    .map_size = end - start + 1,
+                    .prefer = (void *)(start - PV_OFFSET)};
+
+            int retval;
+            retval = rt_aspace_map_phy(rt_kernel_space, &hint, attr,
+                                        start >> MM_PAGE_SHIFT, &err);
+
+            if (retval)
+            {
+                LOG_E("%s: map failed with code %d", retval);
+                RT_ASSERT(0);
+            }
+        }
+    }
+
+    rt_hw_mmu_ktbl_set((unsigned long)rt_kernel_space.page_table);
+    rt_page_cleanup();
+}
+#else
 /**
  * @brief setup Page Table for kernel space. It's a fixed map
  * and all mappings cannot be changed after initialization.
@@ -374,7 +418,7 @@ void rt_hw_mmu_ktbl_set(unsigned long tbl)
  * otherwise is a failure and no report will be
  * returned.
  *
- * @param mmu_info
+ * @param aspace
  * @param mdesc
  * @param desc_nr
  */
@@ -422,6 +466,7 @@ void rt_hw_mmu_setup(rt_aspace_t aspace, struct mem_desc *mdesc, int desc_nr)
     rt_hw_mmu_ktbl_set((unsigned long)rt_kernel_space.page_table);
     rt_page_cleanup();
 }
+#endif
 
 #ifdef RT_USING_SMART
 static void _init_region(void *vaddr, size_t size)
