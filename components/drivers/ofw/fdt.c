@@ -6,6 +6,7 @@
  * Change Logs:
  * Date           Author       Notes
  * 2022-08-25     GuEe-GUI     first version
+ * 2023-10-16     zmshahaha    use memblock to scan memory
  */
 
 #include <rthw.h>
@@ -215,7 +216,7 @@ static rt_err_t fdt_reserved_mem_check_root(int nodeoffset)
 }
 
 /* reserve single /reserved-memory node with reg prop */
-static void fdt_reserved_memory_reg(int nodeoffset, const char *uname)
+static rt_err_t fdt_reserved_memory_reg(int nodeoffset, const char *uname)
 {
     rt_ubase_t base, size;
     const fdt32_t *prop;
@@ -226,6 +227,7 @@ static void fdt_reserved_memory_reg(int nodeoffset, const char *uname)
         if (len && len % t_len != 0)
         {
             LOG_E("Reserved memory: invalid reg property in '%s', skipping node", uname);
+            return -RT_EINVAL;
         }
         else
         {
@@ -247,10 +249,11 @@ static void fdt_reserved_memory_reg(int nodeoffset, const char *uname)
             }
         }
     }
+    return RT_EOK;
 }
 
 /* reserve single /reserved-memory node need to allocate from memblock */
-static void fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
+static rt_err_t fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
 {
     rt_ubase_t base, size, align;
     rt_size_t start, end;
@@ -266,7 +269,7 @@ static void fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
         if (len != _root_size_cells * sizeof(fdt32_t))
         {
             LOG_E("Reserved memory: invalid size property in '%s', skipping node", uname);
-            return;
+            return -RT_EINVAL;
         }
 
         size = rt_fdt_next_cell(&prop, _root_size_cells);
@@ -278,7 +281,7 @@ static void fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
             if (len != _root_addr_cells * sizeof(fdt32_t))
             {
                 LOG_E("Reserved memory: invalid alignment property in '%s', skipping node", uname);
-                return;
+                return -RT_EINVAL;
             }
             align = rt_fdt_next_cell(&prop, _root_addr_cells);
         }
@@ -292,7 +295,7 @@ static void fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
             if (len % t_len != 0)
             {
                 LOG_E("Reserved memory: invalid alloc-ranges property in '%s', skipping node", uname);
-                return;
+                return -RT_EINVAL;
             }
 
             while (len > 0)
@@ -321,22 +324,28 @@ static void fdt_reserved_memory_alloc(int nodeoffset, const char *uname)
         /* translate phy addr back to /reserved-memory addr space */
         base = base - rt_fdt_translate_address(_fdt, nodeoffset, 0);
 
-        /* fill cells to add to fdt */
-        cells = (fdt32_t*)rt_malloc((_root_addr_cells + _root_size_cells) * sizeof(fdt32_t));
-        for (len = _root_addr_cells; len--; ++cells)
-        {
-            *cells = cpu_to_fdt32((uint32_t)base & 0xffffffff);
-            base >>= 32;
-        }
-        for (len = _root_size_cells; len--; ++cells)
-        {
-            *cells = cpu_to_fdt32((uint32_t)size & 0xffffffff);
-            size >>= 32;
-        }
-        cells -= (_root_addr_cells + _root_size_cells);
-
         /* add the alloced region to fdt */
-        fdt_setprop(_fdt, nodeoffset, "reg", cells, _root_addr_cells + _root_size_cells);
+        if(_root_addr_cells == 1)
+        {
+            fdt_setprop_cells(_fdt, nodeoffset, "reg", (uint32_t)base);
+        }
+        else
+        {
+            fdt_setprop_cells(_fdt, nodeoffset, "reg", base);
+        }
+
+        if(_root_size_cells == 1)
+        {
+            fdt_appendprop_cells(_fdt, nodeoffset, "reg", (uint32_t)size);
+        }
+        else
+        {
+            fdt_appendprop_cells(_fdt, nodeoffset, "reg", size);
+        }
+
+        fdt_delprop(_fdt, nodeoffset, "size");
+        fdt_delprop(_fdt, nodeoffset, "alloc-ranges");
+        fdt_delprop(_fdt, nodeoffset, "alignment");
     }
 
     return err;
@@ -363,7 +372,10 @@ static void fdt_scan_reserved_memory(void)
                 }
 
                 uname = fdt_get_name(_fdt, child, RT_NULL);
-                fdt_reserved_memory_reg(child, uname);
+                if (fdt_reserved_memory_reg(child, uname) != RT_EOK)
+                {
+                    LOG_E("Reserved memory: reserve node '%s' failed", uname);
+                }
             }
             /* reserve /reserved-memory need to allocate from memblock */
             fdt_for_each_subnode(child, _fdt, nodeoffset)
@@ -376,7 +388,10 @@ static void fdt_scan_reserved_memory(void)
                 }
 
                 uname = fdt_get_name(_fdt, child, RT_NULL);
-                fdt_reserved_memory_alloc(child, uname);
+                if (fdt_reserved_memory_alloc(child, uname) != RT_EOK)
+                {
+                    LOG_E("Reserved memory: reserve node '%s' failed", uname);
+                }
             }
         }
         else
@@ -405,8 +420,6 @@ static rt_err_t fdt_scan_memory(void)
 
         rt_memblock_reserve_memory("memreserve", base, base + size, MEMBLOCK_NONE);
     }
-
-    no = 0;
 
     fdt_for_each_subnode(nodeoffset, _fdt, 0)
     {
@@ -456,97 +469,12 @@ static rt_err_t fdt_scan_memory(void)
             {
                 LOG_W("Memory node(%d) ranges: %p - %p%s", no, base, base + size, " unable to record");
             }
-
-            ++no;
         }
     }
 
     if (!err)
     {
         fdt_scan_reserved_memory();
-    }
-
-    region = &_memregion[0];
-
-    for (no = 0; region->name; ++region)
-    {
-        /* We need check the memory region now. */
-        for (int i = RT_ARRAY_SIZE(_memregion) - 1; i > no; --i)
-        {
-            rt_region_t *res_region = &_memregion[i];
-
-            if (!res_region->name)
-            {
-                break;
-            }
-
-            /*
-             * case 0:                      case 1:
-             *  +------------------+             +----------+
-             *  |      memory      |             |  memory  |
-             *  +---+----------+---+         +---+----------+---+
-             *      | reserved |             |     reserved     |
-             *      +----------+             +---+----------+---+
-             *
-             * case 2:                      case 3:
-             *  +------------------+                +------------------+
-             *  |      memory      |                |      memory      |
-             *  +--------------+---+------+  +------+---+--------------+
-             *                 | reserved |  | reserved |
-             *                 +----------+  +----------+
-             */
-
-            /* case 0 */
-            if (res_region->start >= region->start && res_region->end <= region->end)
-            {
-                rt_size_t new_size = region->end - res_region->end;
-
-                region->end = res_region->start;
-
-                /* Commit part next block */
-                if (new_size)
-                {
-                    err = commit_memregion(region->name, res_region->end, new_size, RT_FALSE);
-                }
-
-                if (!err)
-                {
-                    ++no;
-
-                    /* Scan again */
-                    region = &_memregion[0];
-                    --region;
-
-                    break;
-                }
-
-                continue;
-            }
-
-            /* case 1 */
-            if (res_region->start <= region->start && res_region->end >= region->end)
-            {
-                region->name = RT_NULL;
-
-                break;
-            }
-
-            /* case 2 */
-            if (res_region->start <= region->end && res_region->end >= region->end)
-            {
-                region->end = res_region->start;
-
-                continue;
-            }
-
-            /* case 3 */
-            if (res_region->start <= region->start && res_region->end >= region->start)
-            {
-                region->start = res_region->end;
-
-                continue;
-            }
-        }
     }
 
     return err;
@@ -588,7 +516,7 @@ rt_err_t rt_fdt_scan_initrd(rt_uint64_t *ranges)
             ranges[0] = rt_fdt_read_number(start, s_len);
             ranges[1] = rt_fdt_read_number(end, e_len);
 
-            commit_memregion("initrd", ranges[0], ranges[1] - ranges[0], RT_TRUE);
+            rt_memblock_reserve_memory("initrd", ranges[0], ranges[1], MEMBLOCK_NONE);
 
             err = RT_EOK;
         }

@@ -382,6 +382,13 @@ void rt_memblock_setup_memory_environment(void)
 {
     struct rt_mmblk_reg *reg, *start_reg, *end_reg;
     rt_err_t err = RT_EOK;
+    rt_ubase_t aspace_base;
+
+#ifdef RT_USING_SMART
+    aspace_base = 0 - ((rt_ubase_t)ARCH_ASPACE_SIZE + 1);
+#else
+    aspace_base = 0xffffd0000000;
+#endif
 
     _memblock_merge_memory();
     rt_slist_for_each_entry(reg, &(mmblk_reserved.reg_list), node)
@@ -394,7 +401,10 @@ void rt_memblock_setup_memory_environment(void)
             _memblock_set_flag(start_reg, end_reg, reg->flags);
         }
     }
+
+    rt_hw_mmu_map_init(&rt_kernel_space, (void *)aspace_base, (rt_ubase_t)ARCH_ASPACE_SIZE + 1, MMUTable);
     _memblock_free_all();
+    rt_hw_mmu_setup();
 }
 
 #ifdef UTEST_MM_API_TC
